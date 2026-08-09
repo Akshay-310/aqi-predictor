@@ -19,7 +19,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests pandas python-dotenv hopsworks pyarrow
+          pip install requests pandas python-dotenv hopsworks pyarrow confluent-kafka
 
       - name: Run hourly fetch script
         env:
