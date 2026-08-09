@@ -10,6 +10,7 @@ import pandas as pd
 import hopsworks
 from datetime import date, timedelta
 from dotenv import load_dotenv
+from preprocessing import clean_pipeline
 
 load_dotenv()
 
@@ -69,6 +70,7 @@ def main():
 
     merged = pd.merge(aq_df, weather_df, on="time", how="inner")
     merged["time"] = pd.to_datetime(merged["time"])
+    merged = clean_pipeline(merged)
 
     print(f"Merged shape: {merged.shape}")
     print(f"Missing values:\n{merged.isna().sum()}")

@@ -1,8 +1,10 @@
 # src/feature_engineering.py
 """
-Reads raw hourly data from the 'aqi_raw_hourly' Hopsworks feature group,
-aggregates to daily, engineers features + horizon targets, and writes
-the result into the 'aqi_daily_features' feature group.
+Reads raw hourly data from Hopsworks, aggregates to daily, engineers
+features (time features, AQI change rate, rolling stats), and adds
+target-day weather features for each horizon — simulating what a
+weather forecast would provide for that future day. Writes the result
+to the 'aqi_daily_features' feature group.
 """
 import os
 import pandas as pd
@@ -11,15 +13,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+WEATHER_VARS = [
+    "temperature_2m", "relative_humidity_2m", "wind_speed_10m",
+    "wind_direction_10m", "surface_pressure", "precipitation",
+    "shortwave_radiation",
+]
+
 
 def connect_to_hopsworks():
-    project = hopsworks.login(
+    return hopsworks.login(
         host=os.getenv("HOPSWORKS_HOST"),
         project=os.getenv("HOPSWORKS_PROJECT"),
         api_key_value=os.getenv("HOPSWORKS_API_KEY"),
         engine="python",
     )
-    return project.get_feature_store()
 
 
 def load_raw_data(fs) -> pd.DataFrame:
@@ -59,6 +66,19 @@ def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_target_day_weather(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each horizon, adds the ACTUAL weather that occurred on that future
+    day. In live inference this will be replaced with forecasted weather
+    from Open-Meteo's forecast API — here we use real historical values,
+    which is the correct approach for training/backtesting.
+    """
+    for horizon in [1, 2, 3]:
+        for var in WEATHER_VARS:
+            df[f"{var}_h{horizon}"] = df[var].shift(-horizon)
+    return df
+
+
 def add_targets(df: pd.DataFrame) -> pd.DataFrame:
     df["target_day1"] = df["us_aqi"].shift(-1)
     df["target_day2"] = df["us_aqi"].shift(-2)
@@ -67,7 +87,7 @@ def add_targets(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main():
-    fs = connect_to_hopsworks()
+    fs = connect_to_hopsworks().get_feature_store()
 
     raw = load_raw_data(fs)
     print(f"Loaded raw hourly rows: {raw.shape}")
@@ -75,6 +95,7 @@ def main():
     daily = aggregate_daily(raw)
     daily = add_time_features(daily)
     daily = add_derived_features(daily)
+    daily = add_target_day_weather(daily)
     daily = add_targets(daily)
 
     before = len(daily)
@@ -84,15 +105,15 @@ def main():
 
     features_fg = fs.get_or_create_feature_group(
         name="aqi_daily_features",
-        version=1,
-        description="Daily aggregated AQI features with time features, rolling stats, and day+1/2/3 targets",
+        version=2,   # bumped version since schema changed (new columns added)
+        description="Daily AQI features with time features, rolling stats, target-day weather, and day+1/2/3 targets",
         primary_key=["date"],
         event_time="date",
         time_travel_format="HUDI",
     )
     features_fg.insert(daily_clean)
 
-    print("Successfully inserted into Hopsworks feature group: aqi_daily_features")
+    print("Successfully inserted into Hopsworks feature group: aqi_daily_features (v2)")
 
 
 if __name__ == "__main__":
