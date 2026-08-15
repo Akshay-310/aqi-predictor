@@ -2,9 +2,10 @@
 """
 Hourly live data collection: fetches the most recent 1-2 hours of
 weather + air quality data from Open-Meteo, cleans it, checks for
-staleness (CAMS updates only every 12-24h), and inserts new rows
-into the aqi_raw_hourly feature group. Designed to run hourly via
-GitHub Actions.
+staleness (flags if a value repeats identically across consecutive
+hours, which can happen if the upstream source hasn't refreshed),
+and inserts new rows into the aqi_raw_hourly feature group. Designed
+to run hourly via GitHub Actions.
 """
 import os
 import requests
@@ -65,8 +66,11 @@ def connect_to_hopsworks():
 def check_staleness(fs, new_data: pd.DataFrame, column: str = "us_aqi") -> None:
     """
     Compares newly fetched values against the most recent rows already
-    stored, to catch CAMS returning the same value across its update
-    cycle. Logs a warning only — doesn't block insertion, since we're
+    stored, to catch a value repeating unexpectedly across several
+    hours (verified against Open-Meteo's live API: hourly us_aqi values
+    do vary hour to hour under normal conditions, so a run of identical
+    values is a genuine signal worth flagging, not expected behavior).
+    Logs a warning only — doesn't block insertion, since we're
     single-source now and have no fallback to switch to.
     """
     try:
@@ -100,7 +104,7 @@ def main():
     # Keep only the last 2 completed hours — avoids inserting the
     # current, possibly-incomplete hour, and avoids re-inserting a huge
     # backlog every run.
-    now = pd.Timestamp.now(tz=None).floor("h")
+    now = pd.Timestamp.now(tz=TIMEZONE).tz_localize(None).floor("h")
     merged = merged[(merged["time"] < now) & (merged["time"] >= now - pd.Timedelta(hours=2))]
 
     if merged.empty:
