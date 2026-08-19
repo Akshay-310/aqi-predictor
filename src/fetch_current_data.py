@@ -1,11 +1,13 @@
 # src/fetch_current_data.py
 """
 Hourly live data collection: fetches the most recent 1-2 hours of
-weather + air quality data from Open-Meteo, cleans it, checks for
-staleness (flags if a value repeats identically across consecutive
-hours, which can happen if the upstream source hasn't refreshed),
-and inserts new rows into the aqi_raw_hourly feature group. Designed
-to run hourly via GitHub Actions.
+weather + air quality data from Open-Meteo, cleans it, and inserts new
+rows into the aqi_raw_hourly feature group.
+
+If the Hopsworks insert fails (e.g. spending-cap throttling), the
+fetched rows are saved to a local pending-upload CSV instead of being
+lost. The next time this script runs successfully, it retries any
+pending rows first, then clears the pending file.
 """
 import os
 import requests
@@ -22,7 +24,8 @@ TIMEZONE = "Asia/Karachi"
 AIR_QUALITY_VARS = "us_aqi,pm2_5,pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone"
 WEATHER_VARS = "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,surface_pressure,precipitation,shortwave_radiation"
 
-STALENESS_CHECK_HOURS = 5  # if this many consecutive us_aqi readings are identical, flag it
+STALENESS_CHECK_HOURS = 5
+PENDING_BACKUP_PATH = "data/raw_backup/pending_upload.csv"
 
 
 def fetch_recent_air_quality() -> pd.DataFrame:
@@ -64,15 +67,6 @@ def connect_to_hopsworks():
 
 
 def check_staleness(fs, new_data: pd.DataFrame, column: str = "us_aqi") -> None:
-    """
-    Compares newly fetched values against the most recent rows already
-    stored, to catch a value repeating unexpectedly across several
-    hours (verified against Open-Meteo's live API: hourly us_aqi values
-    do vary hour to hour under normal conditions, so a run of identical
-    values is a genuine signal worth flagging, not expected behavior).
-    Logs a warning only — doesn't block insertion, since we're
-    single-source now and have no fallback to switch to.
-    """
     try:
         raw_fg = fs.get_feature_group(name="aqi_raw_hourly", version=1)
         existing = raw_fg.read()
@@ -84,12 +78,39 @@ def check_staleness(fs, new_data: pd.DataFrame, column: str = "us_aqi") -> None:
 
         if len(set(recent_values)) == 1 and len(recent_values) == STALENESS_CHECK_HOURS:
             print(f"WARNING: '{column}' has been identical ({recent_values[0]}) for the last "
-                  f"{STALENESS_CHECK_HOURS} hours — possible stale CAMS update cycle. "
-                  f"Data still being inserted, but flagging for awareness.")
+                  f"{STALENESS_CHECK_HOURS} hours — possible upstream staleness.")
         else:
             print(f"Staleness check passed — '{column}' shows variation across recent hours")
     except Exception as e:
         print(f"Staleness check skipped (couldn't read existing data): {e}")
+
+
+def save_pending(df: pd.DataFrame) -> None:
+    """Rows that failed to reach Hopsworks get parked here instead of lost."""
+    os.makedirs(os.path.dirname(PENDING_BACKUP_PATH), exist_ok=True)
+    if os.path.exists(PENDING_BACKUP_PATH):
+        existing = pd.read_csv(PENDING_BACKUP_PATH, parse_dates=["time"])
+        combined = pd.concat([existing, df]).drop_duplicates(subset="time").sort_values("time")
+    else:
+        combined = df.sort_values("time")
+    combined.to_csv(PENDING_BACKUP_PATH, index=False)
+    print(f"WARNING: Hopsworks insert failed — saved {len(df)} row(s) locally. "
+          f"Pending backup now holds {len(combined)} row(s) waiting to sync.")
+
+
+def flush_pending(raw_fg) -> None:
+    """If a previous run failed and left rows pending, retry them now that
+    Hopsworks is reachable, then clear the pending file."""
+    if not os.path.exists(PENDING_BACKUP_PATH):
+        return
+    pending = pd.read_csv(PENDING_BACKUP_PATH, parse_dates=["time"])
+    if pending.empty:
+        os.remove(PENDING_BACKUP_PATH)
+        return
+    print(f"Found {len(pending)} pending row(s) from a previous failed run — retrying...")
+    raw_fg.insert(pending)
+    os.remove(PENDING_BACKUP_PATH)
+    print("Pending backup synced successfully and cleared.")
 
 
 def main():
@@ -101,9 +122,6 @@ def main():
     merged = pd.merge(aq_df, weather_df, on="time", how="inner")
     merged["time"] = pd.to_datetime(merged["time"])
 
-    # Keep only the last 2 completed hours — avoids inserting the
-    # current, possibly-incomplete hour, and avoids re-inserting a huge
-    # backlog every run.
     now = pd.Timestamp.now(tz=TIMEZONE).tz_localize(None).floor("h")
     merged = merged[(merged["time"] < now) & (merged["time"] >= now - pd.Timedelta(hours=2))]
 
@@ -113,20 +131,27 @@ def main():
 
     merged = clean_pipeline(merged)
 
-    fs = connect_to_hopsworks()
-    check_staleness(fs, merged)
+    try:
+        fs = connect_to_hopsworks()
+        check_staleness(fs, merged)
 
-    raw_fg = fs.get_or_create_feature_group(
-        name="aqi_raw_hourly",
-        version=1,
-        description="Raw hourly weather + air quality data for Karachi from Open-Meteo",
-        primary_key=["time"],
-        event_time="time",
-        time_travel_format="HUDI",
-    )
-    raw_fg.insert(merged)
+        raw_fg = fs.get_or_create_feature_group(
+            name="aqi_raw_hourly",
+            version=1,
+            description="Raw hourly weather + air quality data for Karachi from Open-Meteo",
+            primary_key=["time"],
+            event_time="time",
+            time_travel_format="HUDI",
+        )
+        raw_fg.insert(merged)
+        print(f"Successfully inserted {len(merged)} new row(s) into aqi_raw_hourly")
 
-    print(f"Successfully inserted {len(merged)} new row(s) into aqi_raw_hourly")
+        # This run reached Hopsworks fine — also flush anything stranded earlier
+        flush_pending(raw_fg)
+
+    except Exception as e:
+        print(f"WARNING: Hopsworks insert failed ({e}) — saving locally instead.")
+        save_pending(merged)
 
 
 if __name__ == "__main__":
