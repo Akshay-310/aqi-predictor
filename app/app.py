@@ -50,9 +50,13 @@ ADVISORY = {
     "Hazardous": "Emergency conditions. Stay indoors, seal windows and doors, and avoid all outdoor exertion.",
 }
 
-# Which model won each horizon — from your train_models.py results.
-# Update this if you retrain and a different algo wins a horizon.
-HORIZON_MODELS = {1: "Ridge Regression", 2: "Ridge Regression", 3: "LightGBM"}
+# Which model won each horizon — from your latest train_models.py results.
+# day1/day2: Ridge (original 3-algorithm scope). day3: ElasticNet — the
+# only candidate among 5 tested (Ridge/RF/LightGBM/ElasticNet/XGBoost)
+# that didn't overfit. Update this dict if a future retrain changes the
+# winner (the actual model USED is always whatever's registered in
+# Hopsworks — this dict only controls the display badge).
+HORIZON_MODELS = {1: "Ridge Regression", 2: "Ridge Regression", 3: "ElasticNet"}
 
 # Mirrors train_models.py exactly — feature order and naming must match
 # what each registered model was trained on.
