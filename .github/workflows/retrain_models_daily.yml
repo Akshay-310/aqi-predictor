@@ -19,7 +19,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests pandas python-dotenv hopsworks pyarrow confluent-kafka lightgbm scikit-learn joblib
+          pip install requests pandas python-dotenv hopsworks pyarrow confluent-kafka lightgbm xgboost scikit-learn joblib
 
       - name: Run feature engineering
         env:
