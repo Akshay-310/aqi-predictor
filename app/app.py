@@ -225,15 +225,20 @@ def load_current() -> dict:
 
 @st.cache_resource(show_spinner=False)
 def load_model(horizon_name: str):
-    """Downloads and loads the best registered model for a horizon
-    (matches how train_models.py's register_model() saved it: joblib
-    dump to model.pkl inside the model's Hopsworks artifact directory)."""
+    """Loads the LATEST registered version, not mr.get_best_model()'s
+    all-time-lowest-RMSE pick. get_best_model() scans every version ever
+    registered under this name — if an earlier run tested a different
+    candidate pool (e.g. before ElasticNet was scoped out of day1/day2)
+    and happened to score marginally better, it would silently keep
+    winning forever even after being intentionally superseded. Always
+    using the latest version means the dashboard reflects whatever
+    train_models.py's most recent run actually decided, matching its
+    own printed Final Summary."""
     project = get_project()
     mr = project.get_model_registry()
-    model_meta = mr.get_best_model(
-        name=f"aqi_predictor_{horizon_name}", metric="rmse", direction="min"
-    )
-    model_dir = model_meta.download()
+    all_versions = mr.get_models(name=f"aqi_predictor_{horizon_name}")
+    latest = max(all_versions, key=lambda m: m.version)
+    model_dir = latest.download()
     return joblib.load(os.path.join(model_dir, "model.pkl"))
 
 
