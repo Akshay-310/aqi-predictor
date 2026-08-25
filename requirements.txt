@@ -154,3 +154,6 @@ webencodings==0.5.1
 websocket-client==1.9.0
 widgetsnbextension==4.0.15
 xgboost==3.2.0
+iniconfig==2.3.0 
+pluggy==1.6.0 
+pytest==9.1.1
