@@ -1,3 +1,0 @@
-time,us_aqi,pm2_5,pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,surface_pressure,precipitation,shortwave_radiation
-2026-08-25 10:00:00,92,35.0,115.7,265.0,8.3,8.4,69.0,29.7,68,9.8,238,1005.0,0.0,542.0
-2026-08-25 11:00:00,92,38.5,127.6,219.0,6.0,8.2,82.0,30.2,67,12.0,230,1005.1,0.0,628.0
