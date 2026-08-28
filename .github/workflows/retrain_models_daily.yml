@@ -2,7 +2,7 @@ name: Daily Feature Engineering and Model Retraining
 
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '17 2 * * *'
   workflow_dispatch:
 
 jobs:
