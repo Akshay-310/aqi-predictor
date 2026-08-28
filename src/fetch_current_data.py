@@ -1,13 +1,15 @@
-# src/fetch_current_data.py
 """
 Hourly live data collection: fetches the most recent 1-2 hours of
-weather + air quality data from Open-Meteo, cleans it, and inserts new
-rows into the aqi_raw_hourly feature group.
-
-If the Hopsworks insert fails (e.g. spending-cap throttling), the
-fetched rows are saved to a local pending-upload CSV instead of being
-lost. The next time this script runs successfully, it retries any
-pending rows first, then clears the pending file.
+weather + air quality data from Open-Meteo, cleans it, and:
+  1) ALWAYS writes it to a local running CSV backup (data/raw_backup/
+     aqi_raw_hourly_live.csv) — independent of Hopsworks entirely, so
+     the dashboard always has a fresh source even if Hopsworks'
+     materialization jobs are stuck/failing.
+  2) Also tries to insert into Hopsworks as the long-term store. If
+     that insert call itself fails, the rows are additionally saved to
+     a separate pending-retry file and flushed on the next successful
+     run — this is unrelated to materialization health, only covers
+     the insert() call itself failing.
 """
 import os
 import requests
@@ -26,6 +28,9 @@ WEATHER_VARS = "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_directio
 
 STALENESS_CHECK_HOURS = 5
 PENDING_BACKUP_PATH = "data/raw_backup/pending_upload.csv"
+LIVE_BACKUP_PATH = "data/raw_backup/aqi_raw_hourly_live.csv"
+LIVE_BACKUP_MAX_ROWS = 24 * 14  # keep ~2 weeks locally — plenty for live
+                                  # forecasting, keeps the file small
 
 
 def fetch_recent_air_quality() -> pd.DataFrame:
@@ -85,8 +90,28 @@ def check_staleness(fs, new_data: pd.DataFrame, column: str = "us_aqi") -> None:
         print(f"Staleness check skipped (couldn't read existing data): {e}")
 
 
+def update_live_backup(df: pd.DataFrame) -> None:
+    """Always writes the fetched rows to a running local CSV, regardless
+    of what happens with Hopsworks below. This is what makes the
+    dashboard's 'current AQI' and forecast independent of Hopsworks'
+    materialization health entirely."""
+    os.makedirs(os.path.dirname(LIVE_BACKUP_PATH), exist_ok=True)
+    if os.path.exists(LIVE_BACKUP_PATH):
+        existing = pd.read_csv(LIVE_BACKUP_PATH, parse_dates=["time"])
+        combined = pd.concat([existing, df]).drop_duplicates(subset="time").sort_values("time")
+    else:
+        combined = df.sort_values("time")
+
+    # Keep it small — this is a rolling live buffer, not the permanent
+    # archive (that's Hopsworks' job).
+    if len(combined) > LIVE_BACKUP_MAX_ROWS:
+        combined = combined.tail(LIVE_BACKUP_MAX_ROWS)
+
+    combined.to_csv(LIVE_BACKUP_PATH, index=False)
+    print(f"Live backup updated: {len(combined)} rows, latest = {combined['time'].max()}")
+
+
 def save_pending(df: pd.DataFrame) -> None:
-    """Rows that failed to reach Hopsworks get parked here instead of lost."""
     os.makedirs(os.path.dirname(PENDING_BACKUP_PATH), exist_ok=True)
     if os.path.exists(PENDING_BACKUP_PATH):
         existing = pd.read_csv(PENDING_BACKUP_PATH, parse_dates=["time"])
@@ -99,8 +124,6 @@ def save_pending(df: pd.DataFrame) -> None:
 
 
 def flush_pending(raw_fg) -> None:
-    """If a previous run failed and left rows pending, retry them now that
-    Hopsworks is reachable, then clear the pending file."""
     if not os.path.exists(PENDING_BACKUP_PATH):
         return
     pending = pd.read_csv(PENDING_BACKUP_PATH, parse_dates=["time"])
@@ -131,6 +154,9 @@ def main():
 
     merged = clean_pipeline(merged)
 
+    # ALWAYS update the live backup, independent of Hopsworks' status below.
+    update_live_backup(merged)
+
     try:
         fs = connect_to_hopsworks()
         check_staleness(fs, merged)
@@ -146,7 +172,6 @@ def main():
         raw_fg.insert(merged)
         print(f"Successfully inserted {len(merged)} new row(s) into aqi_raw_hourly")
 
-        # This run reached Hopsworks fine — also flush anything stranded earlier
         flush_pending(raw_fg)
 
     except Exception as e:

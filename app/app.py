@@ -191,33 +191,91 @@ def get_project():
 
 @st.cache_data(ttl=900, show_spinner="Loading historical data...")
 def load_historical() -> pd.DataFrame:
-    project = get_project()
-    fs = project.get_feature_store()
-    daily_fg = fs.get_feature_group(name="aqi_daily_features", version=2)
-    df = daily_fg.read()
-    df["date"] = pd.to_datetime(df["date"])
-    if df["date"].dt.tz is not None:
-        df["date"] = df["date"].dt.tz_localize(None)
-    return df.sort_values("date").reset_index(drop=True)
+    """Historical data — merges Hopsworks' aqi_daily_features (long
+    2-year history with full engineered columns, but its tail can lag
+    if materialization is stuck) with a simple local daily aggregation
+    (same DAILY_AGG columns used by build_live_base_row) to fill in any
+    recent dates Hopsworks doesn't have yet. Keeps the full column set
+    (not just date/us_aqi) since render_pollutants() also reads pm2_5,
+    pm10, nitrogen_dioxide, carbon_monoxide, and wind_speed_10m from
+    this same dataframe."""
+    frames = []
+    try:
+        project = get_project()
+        fs = project.get_feature_store()
+        daily_fg = fs.get_feature_group(name="aqi_daily_features", version=2)
+        hw_df = daily_fg.read()
+        hw_df["date"] = pd.to_datetime(hw_df["date"])
+        if hw_df["date"].dt.tz is not None:
+            hw_df["date"] = hw_df["date"].dt.tz_localize(None)
+        frames.append(hw_df)  # appended first — wins whenever present
+    except Exception as e:
+        st.warning(f"Could not read Hopsworks aqi_daily_features: {e}")
+
+    raw = load_merged_raw_hourly()
+    if not raw.empty:
+        raw = raw.copy()
+        raw["date"] = pd.to_datetime(raw["time"].dt.date)
+        local_daily = raw.groupby("date", as_index=False).agg(DAILY_AGG)
+        frames.append(local_daily)  # only fills dates missing from Hopsworks
+
+    if not frames:
+        return pd.DataFrame(columns=["date", "us_aqi"])
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset="date", keep="first")
+    return combined.sort_values("date").reset_index(drop=True)
+
+
+LIVE_BACKUP_PATH = "data/raw_backup/aqi_raw_hourly_live.csv"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_merged_raw_hourly() -> pd.DataFrame:
+    """Merges Hopsworks' raw_hourly table (long history, but its tail can
+    lag if materialization jobs are stuck/failing) with the local live
+    backup CSV (short ~2-week history, but always current — it's written
+    directly by the hourly fetch script regardless of Hopsworks' health).
+    Local data wins on any overlapping timestamp, since it's always at
+    least as fresh. This is what makes the dashboard's current AQI and
+    forecast independent of Hopsworks' materialization status."""
+    frames = []
+    try:
+        project = get_project()
+        fs = project.get_feature_store()
+        hw_df = fs.get_feature_group(name="aqi_raw_hourly", version=1).read()
+        hw_df["time"] = pd.to_datetime(hw_df["time"])
+        if hw_df["time"].dt.tz is not None:
+            hw_df["time"] = hw_df["time"].dt.tz_localize(None)
+        frames.append(hw_df)
+    except Exception as e:
+        st.warning(f"Could not read Hopsworks raw_hourly data: {e}")
+
+    if os.path.exists(LIVE_BACKUP_PATH):
+        local_df = pd.read_csv(LIVE_BACKUP_PATH, parse_dates=["time"])
+        frames.append(local_df)  # appended last so it wins on duplicates below
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset="time", keep="last")
+    return combined.sort_values("time").reset_index(drop=True)
 
 
 @st.cache_data(ttl=900, show_spinner="Loading latest reading...")
 def load_current() -> dict:
-    project = get_project()
-    fs = project.get_feature_store()
-    raw_fg = fs.get_feature_group(name="aqi_raw_hourly", version=1)
-    df = raw_fg.read()
-    df["time"] = pd.to_datetime(df["time"])
+    df = load_merged_raw_hourly()
+    if df.empty:
+        raise RuntimeError("No hourly data available from either Hopsworks or the local backup.")
     latest = df.sort_values("time").iloc[-1]
 
     # fetch_current_data.py requests Open-Meteo data with timezone=Asia/Karachi,
     # so the stored value is ALREADY Karachi local clock time — Hopsworks just
     # tags it "+00:00" by default since no real tz info was attached. Strip
-    # that incorrect tag rather than converting (converting would double-shift
-    # it 5 hours forward, which is what the previous version of this function
-    # did — worth knowing if this code gets copied elsewhere).
+    # that incorrect tag rather than converting.
     latest_time = latest["time"]
-    if latest_time.tzinfo is not None:
+    if pd.notna(latest_time) and hasattr(latest_time, "tzinfo") and latest_time.tzinfo is not None:
         latest_time = latest_time.tz_localize(None)
 
     return {"aqi": float(latest["us_aqi"]), "time": latest_time}
@@ -297,13 +355,15 @@ def build_live_base_row() -> pd.Series | None:
     24-hour day, matching the complete-day averages the models were
     trained on. Today's partial-day average would be an input distribution
     the model never saw during training.
+
+    Sources raw hourly data via load_merged_raw_hourly() (Hopsworks +
+    local live backup, local wins on overlap) so this keeps working even
+    if Hopsworks' materialization jobs are stuck/failing — the forecast
+    doesn't silently go stale just because the sync layer is broken.
     """
-    project = get_project()
-    fs = project.get_feature_store()
-    raw = fs.get_feature_group(name="aqi_raw_hourly", version=1).read()
-    raw["time"] = pd.to_datetime(raw["time"])
-    if raw["time"].dt.tz is not None:
-        raw["time"] = raw["time"].dt.tz_localize(None)  # already Karachi-local, see load_current()
+    raw = load_merged_raw_hourly()
+    if raw.empty:
+        return None
 
     raw["date"] = raw["time"].dt.date
     daily = raw.groupby("date").agg(DAILY_AGG).reset_index()

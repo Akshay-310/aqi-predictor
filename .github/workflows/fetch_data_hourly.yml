@@ -32,11 +32,11 @@ jobs:
         run: |
           python src/fetch_current_data.py
 
-      - name: Commit pending backup if any
+      - name: Commit local backups
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add data/raw_backup/pending_upload.csv 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "Update pending upload backup"
+          git add data/raw_backup/aqi_raw_hourly_live.csv data/raw_backup/pending_upload.csv 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Update local data backups"
           git pull --rebase origin main
           git push
