@@ -113,7 +113,6 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 python-json-logger==4.1.0
 pytz==2026.3.post1
-pywinpty==3.0.5
 PyYAML==6.0.3
 pyzmq==27.1.0
 referencing==0.37.0
@@ -142,7 +141,6 @@ tomli_w==1.2.0
 tornado==6.5.8
 tqdm==4.70.0
 traitlets==5.16.1
-twofish @ file:///C:/ci_310/twofish_1642093326185/work
 typing_extensions==4.16.0
 tzdata==2026.3
 tzlocal==5.4.4
@@ -154,6 +152,6 @@ webencodings==0.5.1
 websocket-client==1.9.0
 widgetsnbextension==4.0.15
 xgboost==3.2.0
-iniconfig==2.3.0 
-pluggy==1.6.0 
+iniconfig==2.3.0
+pluggy==1.6.0
 pytest==9.1.1
