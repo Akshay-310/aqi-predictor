@@ -138,41 +138,75 @@ def inject_css():
 
 def horizon_skyline(aqi: float, height: int = 110) -> str:
     """
-    Signature visual: a skyline where distant buildings fade out as AQI
-    worsens — visibility loss standing in for the AQI number itself.
+    Signature visual: a shifting 'Smog Twilight' gradient wave with
+    drifting particles — density and opacity scale with AQI, standing
+    in for suspended particulate matter (PM2.5) directly, rather than
+    a literal skyline. Worse air = more, denser, more visible particles.
     """
-    visibility = max(0.08, 1 - (aqi / 300))  # 1 = clear, ~0 = hazardous
-    _, color = categorize(aqi)
+    severity = min(1.0, max(0.0, aqi / 300))  # 0 = clean, 1 = hazardous
 
-    n_layers = 5
-    rows = []
-    for i in range(n_layers):
-        depth = i / (n_layers - 1)  # 0 = farthest, 1 = nearest
-        base_opacity = 0.30 + depth * 0.35  # nearer layers read more solid even in clear air
-        layer_opacity = min(1.0, max(0.06, base_opacity * (0.35 + 0.65 * visibility)))
-        y_base = 24 + i * 15
-        h_min, h_max = 14 + i * 9, 28 + i * 13
-        rng = np.random.RandomState(i * 7 + 3)
+    n_particles = int(14 + severity * 40)  # 14 (clean) -> ~54 (hazardous)
+    base_opacity = 0.30 + severity * 0.45   # particles read more solid as AQI worsens
 
-        buildings = []
-        x = -10
-        while x < 630:
-            w = int(rng.randint(20, 40))
-            h = int(rng.randint(h_min, h_max))
-            buildings.append(
-                f'<rect x="{x}" y="{height - y_base - h}" width="{w}" height="{h}" '
-                f'fill="{color}" opacity="{layer_opacity:.2f}" rx="1.5" />'
-            )
-            x += w + int(rng.randint(10, 24))  # gap sized independently of width — no overlap
-        rows.append("".join(buildings))
+    rng = np.random.RandomState(11)
+    particles = []
+    for _ in range(n_particles):
+        size = rng.randint(2, 6)
+        top = rng.randint(5, 95)
+        left = rng.randint(0, 100)
+        duration = rng.randint(16, 32)
+        delay = rng.uniform(0, 10)
+        opacity = min(0.9, base_opacity + rng.uniform(-0.1, 0.15))
+        particles.append(
+            f'<div class="sky-particle" style="width:{size}px; height:{size}px; '
+            f'top:{top}%; left:{left}%; opacity:{opacity:.2f}; '
+            f'animation-duration:{duration}s; animation-delay:-{delay:.1f}s;"></div>'
+        )
+    particles_html = "".join(particles)
 
-    svg = f"""
-    <svg viewBox="0 0 620 {height}" width="100%" height="{height}" preserveAspectRatio="none"
-         style="border-radius:10px; background:linear-gradient(180deg, #FBF7EC 0%, #F1E9D4 100%);">
-        {''.join(rows)}
-    </svg>
+    haze_opacity = 0.08 + severity * 0.12  # subtle even at worst — avoids the "too foggy" problem
+
+    return f"""
+    <style>
+    .sky-frame {{
+        height: {height}px; border-radius: 10px; overflow: hidden; position: relative;
+        background: linear-gradient(270deg, #4A5568, #D4A24C, #C97B84, #D4A24C, #4A5568);
+        background-size: 400% 100%;
+        animation: skyWave 14s ease-in-out infinite;
+    }}
+    @keyframes skyWave {{
+        0% {{ background-position: 0% 50%; }}
+        50% {{ background-position: 100% 50%; }}
+        100% {{ background-position: 0% 50%; }}
+    }}
+    .sky-haze {{
+        position: absolute; top: 0; left: 0; width: 200%; height: 100%;
+        background: repeating-linear-gradient(
+            100deg, transparent 0px, transparent 60px,
+            rgba(255,255,255,{haze_opacity:.2f}) 60px, rgba(255,255,255,{haze_opacity:.2f}) 100px
+        );
+        animation: skyHazeDrift 26s linear infinite;
+    }}
+    @keyframes skyHazeDrift {{
+        from {{ transform: translateX(0); }}
+        to {{ transform: translateX(-50%); }}
+    }}
+    .sky-particle {{
+        position: absolute;
+        border-radius: 50%;
+        background: #2B2A26;
+        animation-name: skyParticleDrift;
+        animation-timing-function: linear;
+        animation-iteration-count: infinite;
+    }}
+    @keyframes skyParticleDrift {{
+        0% {{ transform: translateX(0) translateY(0); }}
+        50% {{ transform: translateX(18px) translateY(-10px); }}
+        100% {{ transform: translateX(0) translateY(0); }}
+    }}
+    </style>
+    <div class="sky-frame"><div class="sky-haze"></div>{particles_html}</div>
     """
-    return svg
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -468,7 +502,24 @@ def render_sidebar():
         )
 
 
-def render_header(current: dict):
+def render_alert_badge(current: dict, forecast: list[dict]) -> str:
+    """Small at-a-glance badge — muted when conditions are fine, lights
+    up in the category color once today OR the 3-day forecast reaches
+    Unhealthy (Sensitive) or worse. Reuses the same worst-case logic as
+    the full advisory card, just condensed into one line."""
+    worst_cat, worst_color = categorize(current["aqi"])
+    for day in forecast:
+        if day["aqi"] is not None:
+            cat, color = categorize(day["aqi"])
+            if severity_index(cat) > severity_index(worst_cat):
+                worst_cat, worst_color = cat, color
+
+    if severity_index(worst_cat) >= severity_index("Unhealthy (Sensitive)"):
+        return f'<span class="badge" style="background-color:{worst_color};">🔔 Alert — {worst_cat}</span>'
+    return '<span class="model-tag">🔔 No alerts</span>'
+
+
+def render_header(current: dict, forecast: list[dict]):
     cat_name, cat_color = categorize(current["aqi"])
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -483,6 +534,10 @@ def render_header(current: dict):
             f"Last reading: {current['time'].strftime('%b %d, %H:%M')} PKT</p>",
             unsafe_allow_html=True,
         )
+        st.markdown(
+            f"<div style='text-align:right;'>{render_alert_badge(current, forecast)}</div>",
+            unsafe_allow_html=True,
+        )
 
     st.markdown(horizon_skyline(current["aqi"]), unsafe_allow_html=True)
 
@@ -493,8 +548,11 @@ def render_header(current: dict):
             f"""
             <div class="card">
                 <p class="muted">CURRENT AQI</p>
-                <span class="aqi-number" style="font-size:3.2rem;">{current['aqi']:.0f}</span>
-                <div><span class="badge" style="background-color:{cat_color};">{cat_name}</span></div>
+                <div style="display:flex; align-items:baseline; justify-content:space-between;">
+                    <span class="aqi-number" style="font-size:3.2rem;">{current['aqi']:.0f}</span>
+                    <span class="badge" style="background-color:{cat_color};">{cat_name}</span>
+                </div>
+                {aqi_scale_bar(current['aqi'])}
             </div>
             """,
             unsafe_allow_html=True,
@@ -509,6 +567,25 @@ def render_header(current: dict):
             """,
             unsafe_allow_html=True,
         )
+
+
+def aqi_scale_bar(aqi: float) -> str:
+    """A gradient strip spanning the full 0-500 AQI scale (using the
+    same category colors as everywhere else in the dashboard, not the
+    generic neon green-to-red convention) with a marker showing exactly
+    where the current reading sits.
+
+    Returned as flush-left, single-line HTML deliberately — Streamlit's
+    markdown parser treats any line indented 4+ spaces as a code block,
+    which was rendering part of this as literal text instead of HTML."""
+    position = min(100, max(0, (aqi / 500) * 100))
+    gradient = ", ".join(color for _, _, _, color in CATEGORY_SCALE)
+    return (
+        f'<div style="position:relative; height:6px; border-radius:3px; margin-top:6px;">'
+        f'<div style="position:absolute; inset:0; border-radius:3px; background:linear-gradient(90deg, {gradient});"></div>'
+        f'<div style="position:absolute; top:-2px; left:{position:.1f}%; width:3px; height:10px; background:#26241F; border-radius:2px; transform:translateX(-50%);"></div>'
+        f"</div>"
+    )
 
 
 # Strongest, most explanatory pollutants per the EDA correlation matrix —
@@ -556,8 +633,25 @@ def render_pollutants(daily_df: pd.DataFrame):
         )
 
 
+def relative_day_label(target_date, today: pd.Timestamp) -> str:
+    """Explicit TODAY/TOMORROW labeling — day1 uses yesterday's completed
+    data as its base, so day1's target date is actually TODAY, not
+    tomorrow. Raw weekday names alone caused real confusion about this;
+    spelling it out prevents misreading the forecast as starting a day
+    later than it does."""
+    delta = (pd.Timestamp(target_date).normalize() - today.normalize()).days
+    if delta == 0:
+        return "Today"
+    elif delta == 1:
+        return "Tomorrow"
+    elif delta == 2:
+        return "Day After"
+    return pd.Timestamp(target_date).strftime("%A")
+
+
 def render_forecast(forecast: list[dict]):
     st.markdown("### Next 3 days")
+    today = pd.Timestamp.now(tz=KARACHI_TZ).tz_localize(None)
     cols = st.columns(3)
     for col, day in zip(cols, forecast):
         aqi_val = day["aqi"]
@@ -574,11 +668,13 @@ def render_forecast(forecast: list[dict]):
                 )
             continue
         cat_name, cat_color = categorize(aqi_val)
+        label = relative_day_label(day["date"], today)
+        date_str = pd.Timestamp(day["date"]).strftime("%b %d")
         with col:
             st.markdown(
                 f"""
                 <div class="card">
-                    <p class="muted">{day['date'].strftime('%A, %b %d').upper()}</p>
+                    <p class="muted">{label.upper()} &middot; {date_str}</p>
                     <span class="aqi-number" style="font-size:2.4rem;">{aqi_val:.0f}</span>
                     <div><span class="badge" style="background-color:{cat_color};">{cat_name}</span></div>
                     <div class="model-tag">predicted by {day['model']}</div>
@@ -699,7 +795,7 @@ def main():
         st.error(f"Could not load data from Hopsworks: {e}")
         st.stop()
 
-    render_header(current)
+    render_header(current, forecast)
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
     render_pollutants(hist)
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
