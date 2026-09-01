@@ -7,6 +7,7 @@ weather forecast would provide for that future day. Writes the result
 to the 'aqi_daily_features' feature group.
 """
 import os
+import time 
 import pandas as pd
 import hopsworks
 from dotenv import load_dotenv
@@ -29,11 +30,20 @@ def connect_to_hopsworks():
     )
 
 
-def load_raw_data(fs) -> pd.DataFrame:
-    raw_fg = fs.get_feature_group(name="aqi_raw_hourly", version=1)
-    df = raw_fg.read()
-    df["time"] = pd.to_datetime(df["time"])
-    return df
+def load_raw_data(fs, max_retries: int = 3) -> pd.DataFrame:
+    for attempt in range(max_retries):
+        try:
+            raw_fg = fs.get_feature_group(name="aqi_raw_hourly", version=1)
+            df = raw_fg.read()
+            df["time"] = pd.to_datetime(df["time"])
+            return df
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = 15 * (attempt + 1)
+                print(f"WARNING: Read attempt {attempt + 1} failed ({e}) — retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
 
 
 def aggregate_daily(df: pd.DataFrame) -> pd.DataFrame:
