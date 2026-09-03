@@ -377,7 +377,7 @@ def fetch_weather_forecast_daily() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def build_live_base_row() -> pd.Series | None:
+def build_live_base_row(min_hours: int = 18) -> pd.Series | None:
     """
     Builds the base feature row live, from raw hourly data, instead of
     reading aqi_daily_features (which structurally excludes recent days —
@@ -385,21 +385,27 @@ def build_live_base_row() -> pd.Series | None:
     so its latest row is always ~3-4 days stale by design; correct for
     training, wrong for live inference).
 
-    Uses YESTERDAY as the base day: the most recent FULLY completed
-    24-hour day, matching the complete-day averages the models were
-    trained on. Today's partial-day average would be an input distribution
-    the model never saw during training.
+    Normally uses YESTERDAY as the base day (the most recent fully
+    completed 24-hour day, matching what the models were trained on).
+    But a day aggregated from too few hours (e.g. during an outage) gives
+    a biased average that would silently corrupt the forecast — so any
+    day with fewer than min_hours of raw readings is excluded, and the
+    most recent day that DOES meet the threshold is used instead. This
+    can return a base day older than yesterday; load_forecast() handles
+    that by computing the correct per-target horizon dynamically rather
+    than assuming a fixed 1/2/3-day offset.
 
     Sources raw hourly data via load_merged_raw_hourly() (Hopsworks +
     local live backup, local wins on overlap) so this keeps working even
-    if Hopsworks' materialization jobs are stuck/failing — the forecast
-    doesn't silently go stale just because the sync layer is broken.
+    if Hopsworks' materialization jobs are stuck/failing.
     """
     raw = load_merged_raw_hourly()
     if raw.empty:
         return None
 
     raw["date"] = raw["time"].dt.date
+    hour_counts = raw.groupby("date").size()
+
     daily = raw.groupby("date").agg(DAILY_AGG).reset_index()
     daily["date"] = pd.to_datetime(daily["date"])
     daily = daily.sort_values("date").reset_index(drop=True)
@@ -410,6 +416,9 @@ def build_live_base_row() -> pd.Series | None:
     if len(daily) < 8:  # need 7 prior days for aqi_roll7
         return None
 
+    # Rolling/derived features computed over the FULL recent history first,
+    # before filtering by completeness — so roll3/roll7 still have proper
+    # context rather than skipping straight past an excluded day.
     daily["day_of_week"] = daily["date"].dt.dayofweek
     daily["month"] = daily["date"].dt.month
     daily["day_of_year"] = daily["date"].dt.dayofyear
@@ -418,11 +427,29 @@ def build_live_base_row() -> pd.Series | None:
     daily["aqi_roll7"] = daily["us_aqi"].shift(1).rolling(window=7).mean()
     daily["pm25_roll3"] = daily["pm2_5"].shift(1).rolling(window=3).mean()
 
-    return daily.iloc[-1]  # yesterday — fully complete
+    daily["hour_count"] = daily["date"].dt.date.map(hour_counts)
+    complete_days = daily[daily["hour_count"] >= min_hours]
+    if complete_days.empty:
+        return None
+
+    return complete_days.iloc[-1].drop("hour_count")
 
 
-def build_feature_row_live(base_row: pd.Series, forecast_weather: pd.DataFrame, horizon: int) -> pd.DataFrame:
-    target_date = base_row["date"] + pd.Timedelta(days=horizon)
+def build_feature_row_live(base_row: pd.Series, forecast_weather: pd.DataFrame, target_date: pd.Timestamp) -> pd.DataFrame:
+    """Builds the feature row for a specific real target_date. The horizon
+    used to select _h{n} weather columns is computed from the gap between
+    base_row's date and target_date — NOT assumed to always be 1/2/3 —
+    since base_row may be older than yesterday if more recent days were
+    excluded for incomplete hourly coverage. Only horizons the model was
+    trained on (1-3) are valid; anything else raises, which load_forecast()
+    turns into a 'pending' card rather than a wrong number."""
+    horizon = (target_date.normalize() - base_row["date"].normalize()).days
+    if horizon not in (1, 2, 3):
+        raise ValueError(
+            f"Target date {target_date.date()} is {horizon} day(s) from the available "
+            f"base day ({base_row['date'].date()}) — outside the trained 1-3 day range."
+        )
+
     weather_row = forecast_weather[forecast_weather["date"] == target_date]
     if weather_row.empty:
         raise ValueError(f"No forecast weather available for {target_date.date()}")
@@ -438,25 +465,34 @@ def build_feature_row_live(base_row: pd.Series, forecast_weather: pd.DataFrame, 
 
 @st.cache_data(ttl=3600, show_spinner="Running 3-day forecast...")
 def load_forecast() -> list[dict]:
-    """Predicts day1/2/3 AQI from yesterday's completed base features plus
-    real Open-Meteo weather forecasts for each target day. Since the base
-    day is yesterday, day1 = today, day2 = tomorrow, day3 = the day after."""
+    """Predicts AQI for today, tomorrow, and the day after — always tied
+    to real calendar dates, regardless of which day ended up being used
+    as the feature base (normally yesterday, but an incomplete day falls
+    back to the most recent day with full hourly coverage). If the
+    available base day is too old to reach a given target date within the
+    model's trained 1-3 day range, that card is left pending rather than
+    showing a number built on a mismatched assumption."""
     base_row = build_live_base_row()
     if base_row is None:
-        st.warning("Not enough recent history yet to generate a forecast (need 7+ days).")
-        return [{"day": h, "date": None, "aqi": None, "model": HORIZON_MODELS[h]} for h in (1, 2, 3)]
+        st.warning("Not enough recent, complete history to generate a forecast.")
+        today_local = pd.Timestamp.now(tz=KARACHI_TZ).tz_localize(None).normalize()
+        return [
+            {"day": h, "date": today_local + pd.Timedelta(days=h - 1), "aqi": None, "model": HORIZON_MODELS[h]}
+            for h in (1, 2, 3)
+        ]
 
     forecast_weather = fetch_weather_forecast_daily()
+    today_local = pd.Timestamp.now(tz=KARACHI_TZ).tz_localize(None).normalize()
 
     results = []
     for h, horizon_name in HORIZON_NAMES.items():
-        target_date = base_row["date"] + pd.Timedelta(days=h)
+        target_date = today_local + pd.Timedelta(days=h - 1)  # h=1 -> today, h=2 -> tomorrow, h=3 -> day after
         try:
             model = load_model(horizon_name)
-            X = build_feature_row_live(base_row, forecast_weather, h)
+            X = build_feature_row_live(base_row, forecast_weather, target_date)
             predicted_aqi = float(model.predict(X)[0])
         except Exception as e:
-            st.warning(f"Could not generate {horizon_name} forecast: {e}")
+            st.warning(f"Could not generate a forecast for {target_date.strftime('%b %d')}: {e}")
             predicted_aqi = None
         results.append(
             {

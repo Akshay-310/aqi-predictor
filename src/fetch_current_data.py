@@ -1,6 +1,6 @@
 """
-Hourly live data collection: fetches the most recent 1-2 hours of
-weather + air quality data from Open-Meteo, cleans it, and:
+Hourly live data collection: fetches recent weather + air quality data
+from Open-Meteo, cleans it, and:
   1) ALWAYS writes it to a local running CSV backup (data/raw_backup/
      aqi_raw_hourly_live.csv) — independent of Hopsworks entirely, so
      the dashboard always has a fresh source even if Hopsworks'
@@ -10,6 +10,13 @@ weather + air quality data from Open-Meteo, cleans it, and:
      a separate pending-retry file and flushed on the next successful
      run — this is unrelated to materialization health, only covers
      the insert() call itself failing.
+
+Fetches a wide (~60 hour) trailing window rather than just the last 2
+hours, deliberately — GitHub Actions' scheduled triggers have proven
+unreliable (observed firing only 5-7 times/day instead of hourly), so
+each successful run needs to be able to catch up everything missed
+since the last one, not just the most recent couple of hours.
+Deduplication (by timestamp) makes re-fetching overlapping hours safe.
 """
 import os
 import requests
@@ -32,13 +39,16 @@ LIVE_BACKUP_PATH = "data/raw_backup/aqi_raw_hourly_live.csv"
 LIVE_BACKUP_MAX_ROWS = 24 * 14  # keep ~2 weeks locally — plenty for live
                                   # forecasting, keeps the file small
 
+FETCH_PAST_DAYS = 3          # widened from 1 — gives ~72h of API-side history to draw from
+CATCH_UP_WINDOW_HOURS = 60   # widened from 2 — safely covers even a full day of missed runs
+
 
 def fetch_recent_air_quality() -> pd.DataFrame:
     url = "https://air-quality-api.open-meteo.com/v1/air-quality"
     params = {
         "latitude": LAT, "longitude": LON,
         "hourly": AIR_QUALITY_VARS,
-        "past_days": 1,
+        "past_days": FETCH_PAST_DAYS,
         "forecast_days": 1,
         "timezone": TIMEZONE,
     }
@@ -52,7 +62,7 @@ def fetch_recent_weather() -> pd.DataFrame:
     params = {
         "latitude": LAT, "longitude": LON,
         "hourly": WEATHER_VARS,
-        "past_days": 1,
+        "past_days": FETCH_PAST_DAYS,
         "forecast_days": 1,
         "timezone": TIMEZONE,
     }
@@ -102,8 +112,6 @@ def update_live_backup(df: pd.DataFrame) -> None:
     else:
         combined = df.sort_values("time")
 
-    # Keep it small — this is a rolling live buffer, not the permanent
-    # archive (that's Hopsworks' job).
     if len(combined) > LIVE_BACKUP_MAX_ROWS:
         combined = combined.tail(LIVE_BACKUP_MAX_ROWS)
 
@@ -137,7 +145,7 @@ def flush_pending(raw_fg) -> None:
 
 
 def main():
-    print("Fetching current hourly data...")
+    print("Fetching recent hourly data (wide catch-up window)...")
 
     aq_df = fetch_recent_air_quality()
     weather_df = fetch_recent_weather()
@@ -146,7 +154,7 @@ def main():
     merged["time"] = pd.to_datetime(merged["time"])
 
     now = pd.Timestamp.now(tz=TIMEZONE).tz_localize(None).floor("h")
-    merged = merged[(merged["time"] < now) & (merged["time"] >= now - pd.Timedelta(hours=2))]
+    merged = merged[(merged["time"] < now) & (merged["time"] >= now - pd.Timedelta(hours=CATCH_UP_WINDOW_HOURS))]
 
     if merged.empty:
         print("No new rows to insert for this run.")
