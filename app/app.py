@@ -533,16 +533,25 @@ def render_sidebar():
             st.rerun()
         st.markdown("---")
         st.markdown(
-            "<p class='muted'>Karachi AQI Predictor<br>Data Science Internship Project</p>",
+            "<p class='muted'>Karachi AQI Predictor<br>10Pearls Shine Internship project.<br><br>Developed by Akshay Kumar</p>",
             unsafe_allow_html=True,
         )
 
 
 def render_alert_badge(current: dict, forecast: list[dict]) -> str:
-    """Small at-a-glance badge — muted when conditions are fine, lights
-    up in the category color once today OR the 3-day forecast reaches
-    Unhealthy (Sensitive) or worse. Reuses the same worst-case logic as
-    the full advisory card, just condensed into one line."""
+    """Interactive bell icon — golden and static when conditions are fine,
+    red with a pulsing 'siren ring' animation once today OR the 3-day
+    forecast reaches Unhealthy (Sensitive) or worse. Click slides a
+    single-line label open to the LEFT of the bell — an in-flow flex
+    row (label grows in place, bell stays anchored right via
+    justify-content:flex-end), not absolute positioning, which was
+    causing the label to squish/wrap awkwardly. Uses native HTML
+    <details>/<summary> — no Streamlit rerun or session state needed.
+
+    Built via flush string concatenation, not a triple-quoted block —
+    Streamlit's markdown parser treats any line indented 4+ spaces as a
+    code block, which silently rendered part of an earlier version of
+    this as literal text instead of parsing it as HTML."""
     worst_cat, worst_color = categorize(current["aqi"])
     for day in forecast:
         if day["aqi"] is not None:
@@ -550,9 +559,41 @@ def render_alert_badge(current: dict, forecast: list[dict]) -> str:
             if severity_index(cat) > severity_index(worst_cat):
                 worst_cat, worst_color = cat, color
 
-    if severity_index(worst_cat) >= severity_index("Unhealthy (Sensitive)"):
-        return f'<span class="badge" style="background-color:{worst_color};">🔔 Alert — {worst_cat}</span>'
-    return '<span class="model-tag">🔔 No alerts</span>'
+    is_alert = severity_index(worst_cat) >= severity_index("Unhealthy (Sensitive)")
+    bell_color = worst_color if is_alert else "#D4A24C"
+    message = f"{worst_cat} — {ADVISORY[worst_cat]}" if is_alert else "No alerts today"
+    siren_rings = (
+        '<span class="siren-ring"></span><span class="siren-ring" style="animation-delay: 0.6s;"></span>'
+        if is_alert
+        else ""
+    )
+
+    style = (
+        "<style>"
+        ".alert-summary { cursor: pointer; list-style: none; display: inline-flex; align-items: center; justify-content: flex-end; gap: 0; }"
+        ".alert-summary::-webkit-details-marker { display: none; }"
+        ".bell-icon { position: relative; width: 24px; height: 24px; display: inline-block; flex-shrink: 0; }"
+        f".siren-ring {{ position: absolute; top: 50%; left: 50%; width: 22px; height: 22px; border-radius: 50%; background: {bell_color}; transform: translate(-50%, -50%) scale(1); opacity: 0.6; animation: sirenPulse 1.6s ease-out infinite; }}"
+        "@keyframes sirenPulse { 0% { transform: translate(-50%, -50%) scale(1); opacity: 0.55; } 100% { transform: translate(-50%, -50%) scale(2.6); opacity: 0; } }"
+        ".alert-label { display: inline-block; white-space: nowrap; overflow: hidden; max-width: 0; opacity: 0; font-size: 0.8rem; color: #3B392F; transition: max-width 0.3s ease, opacity 0.3s ease, margin-right 0.3s ease; margin-right: 0; }"
+        "details[open] .alert-label { max-width: 320px; opacity: 1; margin-right: 8px; }"
+        "</style>"
+    )
+    svg = (
+        f'<svg width="24" height="24" viewBox="0 0 24 24" style="position:relative; z-index:1;">'
+        f'<path fill="{bell_color}" d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.89 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/>'
+        f"</svg>"
+    )
+
+    return (
+        style
+        + '<details><summary class="alert-summary">'
+        + f'<span class="alert-label">{message}</span>'
+        + '<span class="bell-icon">'
+        + siren_rings
+        + svg
+        + "</span></summary></details>"
+    )
 
 
 def render_header(current: dict, forecast: list[dict]):
